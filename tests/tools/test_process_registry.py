@@ -2564,6 +2564,52 @@ class TestSystemdCgroupIsolation:
 
         assert pr._worker_memory_max_bytes() == pr._DEFAULT_WORKER_MEMORY_MAX_BYTES
 
+    def test_worker_memory_max_cap_bytes_is_pinned_to_twelve_gib(self):
+        """The cap bounds host risk, so it must never be widened past the
+        deliberately chosen 12 GiB.
+
+        It must also stay above 6 GiB: the AgentRadio verifier's typecheck leg
+        peaks at ~5012 MB RSS and its build leg at ~4870 MB RSS, so a cap below
+        6 GiB cannot host either leg (the 8 GiB V8 heap requested inside a 4 GiB
+        scope is what produced the OOM kill this cap exists to prevent).
+
+        Asserted on the constant, not on the host's RAM, so the test means the
+        same thing on a small CI box as on a big host.
+        """
+        import tools.process_registry as pr
+
+        six_gib = 6 * 1024**3
+        twelve_gib = 12 * 1024**3
+
+        assert pr._WORKER_MEMORY_MAX_CAP_BYTES >= six_gib, (
+            pr._WORKER_MEMORY_MAX_CAP_BYTES, six_gib
+        )
+        assert pr._WORKER_MEMORY_MAX_CAP_BYTES <= twelve_gib, (
+            pr._WORKER_MEMORY_MAX_CAP_BYTES, twelve_gib
+        )
+
+    def test_worker_memory_max_bytes_is_capped_by_the_cap_constant(self, monkeypatch):
+        """With plenty of RAM and no readable cgroup limit, the computed bound is
+        the cap constant itself — the cap really is the ceiling."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(
+            pr.Path,
+            "read_text",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("no cgroup")),
+        )
+        monkeypatch.setattr(
+            pr.os,
+            "sysconf",
+            lambda name: {
+                "SC_PHYS_PAGES": 1 << 30,
+                "SC_PAGE_SIZE": 4096,
+            }[name],
+        )
+
+        assert pr._worker_memory_max_bytes() == pr._WORKER_MEMORY_MAX_CAP_BYTES
+        assert pr._worker_memory_max_bytes() >= 6 * 1024**3
+
     def test_kill_recovered_detached_already_exited_stops_persisted_scope(
         self, registry, monkeypatch
     ):
