@@ -62,7 +62,7 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 # "authoritative" in worker progress prose, parking a healthy card forever
 # (#117009).
 _RESPAWN_BLOCKER_RE = re.compile(
-    r"\b(quota|rate[\s_\-]?limit|429|403|"
+    r"\b(quota|rate[_\s\-]?limit|429|403|"
     r"auth|authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
     r"authoris(?:e|es|ed|ing|ation)|authz|"
     r"unauthorized|forbidden|billing|subscription|"
@@ -70,6 +70,7 @@ _RESPAWN_BLOCKER_RE = re.compile(
     r"invalid[\s_]api[\s_]key)\b",
     re.IGNORECASE,
 )
+_RATE_LIMIT_RE = re.compile(r"rate[_\s\-]?limit", re.IGNORECASE)
 
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
@@ -83,10 +84,97 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# After this long, ``active_pr`` guard releases the task and an alert fires —
+# the guard's duplicate-PR protection is still honoured (the PR stays visible on
+# the board), but the task is no longer starved indefinitely while waiting for
+# a human to act on the PR.  Overridable via
+# ``HERMES_KANBAN_ACTIVE_PR_STARVATION_THRESHOLD_SECONDS``.
+DEFAULT_ACTIVE_PR_STARVATION_THRESHOLD_SECONDS = 1800  # 30 minutes
+
+# Per-task ``active_pr`` starvation clock: task_id -> epoch when the guard first fired.
+# Kept in-process only (a dispatcher restart resets the clock — starvation cannot
+# accumulate across unrelated process lifetimes, and a restarted dispatcher is
+# a different failure mode).  Trimmed on every dispatch pass.
+_active_pr_starvation_clock: dict[str, float] = {}
+
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+
+
+def _resolve_active_pr_starvation_threshold() -> int:
+    """``HERMES_KANBAN_ACTIVE_PR_STARVATION_THRESHOLD_SECONDS``, else
+    ``DEFAULT_ACTIVE_PR_STARVATION_THRESHOLD_SECONDS`` (30 minutes). Zero
+    disables the cap (unlimited starvation, no alert)."""
+    try:
+        raw = os.environ.get("HERMES_KANBAN_ACTIVE_PR_STARVATION_THRESHOLD_SECONDS", "")
+        if raw.strip():
+            return max(0, int(raw))
+    except (TypeError, ValueError):
+        pass
+    return DEFAULT_ACTIVE_PR_STARVATION_THRESHOLD_SECONDS
+
+
+def _trim_starvation_clock(now: float) -> None:
+    """Drop clock entries older than the threshold (1-minute tolerance)."""
+    threshold = _resolve_active_pr_starvation_threshold()
+    if threshold <= 0:
+        _active_pr_starvation_clock.clear()
+        return
+    cutoff = now - threshold - 60
+    for tid in [t for t, s in _active_pr_starvation_clock.items() if s < cutoff]:
+        _active_pr_starvation_clock.pop(tid, None)
+
+
+def _check_active_pr_starvation(
+    result: DispatchResult,
+    conn: sqlite3.Connection,
+    board: Optional[str],
+    now: float,
+) -> None:
+    """For every task in ``respawn_guarded`` with reason ``"active_pr"``,
+    check whether it has been starved past the threshold.  If so, record
+    ``starvation_alert`` (fires once per expiry event, not every tick) and
+    delete the clock entry so the task is no longer guarded."""
+    threshold = _resolve_active_pr_starvation_threshold()
+    if threshold <= 0:
+        return
+    _trim_starvation_clock(now)
+    expired: list[tuple[str, float]] = []  # (task_id, starved_seconds)
+    for tid, reason in result.respawn_guarded:
+        if reason != "active_pr":
+            continue
+        if tid not in _active_pr_starvation_clock:
+            _active_pr_starvation_clock[tid] = now
+            continue
+        starved = now - _active_pr_starvation_clock[tid]
+        if starved >= threshold:
+            expired.append((tid, starved))
+            _active_pr_starvation_clock.pop(tid, None)
+    if not expired:
+        return
+    for tid, starved in expired:
+        result.starvation_alert.append((tid, int(starved)))
+        _kb._log.warning(
+            "kanban dispatcher: task %s active_pr guard released after %ds "
+            "starvation (threshold=%ds). Please review the associated PR or "
+            "unblock the card; duplicate-PR protection remains honoured.",
+            tid, int(starved), threshold,
+        )
+        try:
+            with _kb.write_txn(conn):
+                _kb._insert_comment(
+                    conn, tid, "dispatcher",
+                    f"[starvation alert] active_pr guard released after "
+                    f"{int(starved) // 60}m{int(starved) % 60}s of starvation "
+                    f"(threshold={threshold}s). The card is now spawnable; "
+                    f"please review the associated PR or unblock the card.",
+                    int(now),
+                )
+        except Exception:
+            # Best-effort: a failed comment must not block the dispatch tick.
+            pass
 
 
 @dataclass
@@ -153,6 +241,11 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    starvation_alert: list[tuple[str, int]] = field(default_factory=list)
+    """``(task_id, starvation_seconds)`` pairs for tasks whose ``active_pr``
+    guard has exceeded the starvation threshold and been released this tick —
+    the task is now spawnable, but the operator should act on the PR or unblock
+    the card. Emitted once per affected task per threshold-expiry event."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -163,10 +256,13 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
     CLI daemon and the embedded gateway dispatcher, which otherwise report a
     bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    guard reason is written (#111910).  When ``active_pr`` starvation alerts
+    have fired, appends ``[STARVING: N tasks held by active_pr > 30 m]`` so
+    the warning is unmissable even when the suppression string is long.
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    starvation_tasks: list[tuple[str, int]] = []
     for res in results:
         if res is None:
             continue
@@ -178,10 +274,23 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.starvation_alert:
+            starvation_tasks.extend(res.starvation_alert)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
-    return ", ".join(parts)
+    base = ", ".join(parts)
+    if starvation_tasks:
+        # Group by rounded-minute bucket so the message is readable.
+        by_minutes: dict[int, list[str]] = {}
+        for tid, secs in starvation_tasks:
+            bucket = (secs + 59) // 60  # round up to whole minutes
+            by_minutes.setdefault(bucket, []).append(tid)
+        if by_minutes:
+            pieces = [f"{len(tids)} task(s) starved by active_pr > {bm}m"
+                      for bm, tids in sorted(by_minutes.items())]
+            base += f" [{', '.join(pieces)}]"
+    return base
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1589,7 +1698,15 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    # If latest_run is a non-crash outcome and the error is rate-limit text
+    # (e.g. "rate-limited (quota wall)" from a requeue), skip blocker_auth: the
+    # rate_limit_cooldown handles that case and the error text is stale.
+    # Exception: crash outcomes may carry auth-like text in captured output.
+    if (err and latest_outcome != "crashed"
+            and not (latest_run is not None
+                     and latest_outcome in ("rate_limited", "review_requested")
+                     and _RATE_LIMIT_RE.search(err))
+            and _RESPAWN_BLOCKER_RE.search(err)):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -2423,6 +2540,13 @@ def _dispatch_once_locked(
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+
+    # active_pr starvation check: after the lane loops have populated
+    # respawn_guarded, see if any active_pr-guard tasks have been held past
+    # the threshold.  This runs every tick so the clock stays accurate and
+    # expired tasks get one alert each time they expire (not every tick).
+    _check_active_pr_starvation(result, conn, board=board, now=time.time())
+
     return result
 
 
