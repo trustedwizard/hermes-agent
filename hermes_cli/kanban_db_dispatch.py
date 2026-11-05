@@ -2002,6 +2002,8 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
+        from hermes_cli.kanban_development_routes import prepare_pending
+        prepare_pending(conn, dry_run=dry_run)
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -2037,17 +2039,7 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
-    """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
-    import inspect
-    try:
-        sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
-    except (TypeError, ValueError):
-        return spawn_fn(task, workspace)
+from hermes_cli.kanban_db_spawn_callback import _call_spawn_fn
 
 
 def _dispatch_lane_task(
